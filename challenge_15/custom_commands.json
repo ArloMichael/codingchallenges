@@ -1,0 +1,12 @@
+{
+  "commands": [
+    {
+      "name": "test_command",
+      "phrases": [
+        "run custom command",
+        "test custom command"
+      ],
+      "response": "The custom command is working."
+    }
+  ]
+}

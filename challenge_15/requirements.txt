@@ -1,0 +1,6 @@
+Flask
+flask-sock
+huggingface-hub
+mlx-audio>=0.3.0
+mlx-lm
+numpy

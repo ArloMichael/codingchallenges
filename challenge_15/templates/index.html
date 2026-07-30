@@ -1,0 +1,441 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Speech</title>
+  <style>
+    #assistantMeter {
+      --assistant-level: 0;
+      --user-level: 0;
+      --orb-highlight: #cbd5e1;
+      --orb-mid: #64748b;
+      --orb-low: #334155;
+      --orb-glow-rgb: 100, 116, 139;
+      width: 104px;
+      height: 104px;
+      margin: 16px 0;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 30%, var(--orb-highlight), var(--orb-mid) 55%, var(--orb-low));
+      box-shadow:
+        0 0 calc(12px + var(--assistant-level) * 42px + var(--user-level) * 36px) rgba(var(--orb-glow-rgb), calc(0.25 + var(--assistant-level) * 0.35 + var(--user-level) * 0.3)),
+        0 0 calc(var(--assistant-level) * 88px + var(--user-level) * 72px) rgba(var(--orb-glow-rgb), calc(var(--assistant-level) * 0.45 + var(--user-level) * 0.35));
+      opacity: calc(0.55 + var(--assistant-level) * 0.25 + var(--user-level) * 0.2);
+      transform: scale(calc(1 + var(--assistant-level) * 0.42 + var(--user-level) * 0.34));
+      transition:
+        background 160ms ease,
+        box-shadow 80ms linear,
+        opacity 90ms linear,
+        transform 80ms linear;
+    }
+
+    #assistantMeter[data-speaker="user"] {
+      --orb-highlight: #86efac;
+      --orb-mid: #22c55e;
+      --orb-low: #166534;
+      --orb-glow-rgb: 34, 197, 94;
+    }
+
+    #assistantMeter[data-speaker="assistant"] {
+      --orb-highlight: #93c5fd;
+      --orb-mid: #2563eb;
+      --orb-low: #1e3a8a;
+      --orb-glow-rgb: 37, 99, 235;
+    }
+
+    #assistantMeter[data-speaker="both"] {
+      --orb-highlight: #f0abfc;
+      --orb-mid: #8b5cf6;
+      --orb-low: #4c1d95;
+      --orb-glow-rgb: 139, 92, 246;
+    }
+  </style>
+</head>
+<body>
+  <h1>Speech</h1>
+
+  <button id="start">Ask for mic and start</button>
+  <button id="stop" disabled>Stop transcription</button>
+  <div id="assistantMeter" data-speaker="idle" aria-hidden="true"></div>
+  <div id="status">Idle</div>
+
+  <script>
+    const speechLanguage = "en-US";
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const startButton = document.getElementById("start");
+    const stopButton = document.getElementById("stop");
+    const assistantMeter = document.getElementById("assistantMeter");
+    const statusEl = document.getElementById("status");
+
+    let audioContext = null;
+    let playerNode = null;
+    let workletLoaded = false;
+    let transcriptSocket = null;
+    let isListening = false;
+
+    function setStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function setListening(listening) {
+      isListening = listening;
+      startButton.disabled = listening;
+      stopButton.disabled = !listening;
+    }
+
+    function websocketUrl(path) {
+      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+      return `${scheme}://${window.location.host}${path}`;
+    }
+
+    const orbSpeakerState = {
+      userActive: false,
+      assistantActive: false,
+
+      setUserActive(active) {
+        this.userActive = active;
+        this.render();
+      },
+
+      setAssistantActive(active) {
+        this.assistantActive = active;
+        this.render();
+      },
+
+      render() {
+        if (this.userActive && this.assistantActive) {
+          assistantMeter.dataset.speaker = "both";
+        } else if (this.userActive) {
+          assistantMeter.dataset.speaker = "user";
+        } else if (this.assistantActive) {
+          assistantMeter.dataset.speaker = "assistant";
+        } else {
+          assistantMeter.dataset.speaker = "idle";
+        }
+      },
+
+      reset() {
+        this.userActive = false;
+        this.assistantActive = false;
+        this.render();
+      },
+    };
+
+    const userAudioMeter = {
+      stream: null,
+      source: null,
+      analyser: null,
+      data: null,
+      level: 0,
+      frame: null,
+
+      async start() {
+        if (this.stream) return true;
+
+        console.log("Requesting microphone permission...");
+
+        try {
+          audioContext = audioContext || new AudioContext({ sampleRate: 48000 });
+          this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          this.source = audioContext.createMediaStreamSource(this.stream);
+          this.analyser = audioContext.createAnalyser();
+          this.analyser.fftSize = 1024;
+          this.data = new Float32Array(this.analyser.fftSize);
+          this.source.connect(this.analyser);
+          await audioContext.resume();
+          console.log("Microphone permission granted.");
+          this.tick();
+          return true;
+        } catch {
+          console.log("Microphone permission denied or unavailable.");
+          this.stop();
+          return false;
+        }
+      },
+
+      tick() {
+        if (!this.analyser || !this.data) return;
+
+        this.analyser.getFloatTimeDomainData(this.data);
+
+        let sum = 0;
+        for (let i = 0; i < this.data.length; i++) {
+          sum += this.data[i] * this.data[i];
+        }
+
+        const rms = Math.sqrt(sum / this.data.length);
+        const target = Math.min(1, Math.max(0, rms - 0.012) * 24);
+        const rate = target > this.level ? 0.35 : 0.18;
+        this.level += (target - this.level) * rate;
+
+        assistantMeter.style.setProperty("--user-level", this.level.toFixed(3));
+        orbSpeakerState.setUserActive(this.level > 0.05);
+
+        this.frame = requestAnimationFrame(() => this.tick());
+      },
+
+      stop() {
+        if (this.frame !== null) {
+          cancelAnimationFrame(this.frame);
+          this.frame = null;
+        }
+
+        if (this.source) {
+          this.source.disconnect();
+          this.source = null;
+        }
+
+        if (this.stream) {
+          this.stream.getTracks().forEach(track => track.stop());
+          this.stream = null;
+        }
+
+        this.analyser = null;
+        this.data = null;
+        this.level = 0;
+        assistantMeter.style.setProperty("--user-level", "0");
+        orbSpeakerState.setUserActive(false);
+      },
+    };
+
+    const assistantAudioMeter = {
+      level: 0,
+      target: 0,
+      frame: null,
+
+      updateFromLevel(rms) {
+        this.target = Math.min(1, rms * 16);
+        if (this.target > 0.04) {
+          orbSpeakerState.setAssistantActive(true);
+        }
+        this.start();
+      },
+
+      start() {
+        if (this.frame !== null) return;
+
+        const tick = () => {
+          const rate = this.target > this.level ? 0.45 : 0.25;
+          this.level += (this.target - this.level) * rate;
+          this.target *= 0.86;
+
+          if (this.level < 0.01 && this.target < 0.01) {
+            this.reset();
+            return;
+          }
+
+          assistantMeter.style.setProperty("--assistant-level", this.level.toFixed(3));
+          this.frame = requestAnimationFrame(tick);
+        };
+
+        this.frame = requestAnimationFrame(tick);
+      },
+
+      reset() {
+        if (this.frame !== null) {
+          cancelAnimationFrame(this.frame);
+          this.frame = null;
+        }
+
+        this.level = 0;
+        this.target = 0;
+        assistantMeter.style.setProperty("--assistant-level", "0");
+        orbSpeakerState.setAssistantActive(false);
+      },
+    };
+
+    const assistantPlayback = {
+      endsAt: 0,
+      finishTimer: null,
+
+      now() {
+        return audioContext ? audioContext.currentTime : performance.now() / 1000;
+      },
+
+      trackBuffer(buffer) {
+        this.cancelFinish();
+
+        const sampleCount = buffer.byteLength / Float32Array.BYTES_PER_ELEMENT;
+        const sampleRate = audioContext ? audioContext.sampleRate : 48000;
+        this.endsAt = Math.max(this.now(), this.endsAt) + sampleCount / sampleRate;
+      },
+
+      finishWhenDrained(callback) {
+        const delayMs = Math.max(0, (this.endsAt - this.now()) * 1000);
+
+        this.finishTimer = setTimeout(() => {
+          this.finishTimer = null;
+          this.endsAt = 0;
+          callback();
+        }, delayMs);
+      },
+
+      cancelFinish() {
+        if (this.finishTimer !== null) {
+          clearTimeout(this.finishTimer);
+          this.finishTimer = null;
+        }
+      },
+
+      reset() {
+        this.cancelFinish();
+
+        this.endsAt = 0;
+      },
+    };
+
+    function openTranscriptSocket() {
+      if (transcriptSocket && transcriptSocket.readyState === WebSocket.OPEN) {
+        return Promise.resolve();
+      }
+
+      return new Promise((resolve, reject) => {
+        transcriptSocket = new WebSocket(websocketUrl("/responses"));
+        transcriptSocket.binaryType = "arraybuffer";
+
+        transcriptSocket.onopen = () => {
+          resolve();
+        };
+
+        transcriptSocket.onmessage = (event) => {
+          if (event.data instanceof ArrayBuffer) {
+            assistantPlayback.trackBuffer(event.data);
+            playerNode.port.postMessage(event.data, [event.data]);
+            return;
+          }
+
+          const message = JSON.parse(event.data);
+
+          if (message.type === "response_text" && message.text) {
+            assistantPlayback.cancelFinish();
+            setStatus("Speaking");
+            console.log("Response text:", message.text);
+          } else if (message.type === "done") {
+            assistantPlayback.finishWhenDrained(() => {
+              assistantAudioMeter.reset();
+              orbSpeakerState.setAssistantActive(false);
+              setStatus(isListening ? "Listening" : "Idle");
+            });
+          } else if (message.type === "error") {
+            assistantPlayback.reset();
+            assistantAudioMeter.reset();
+            orbSpeakerState.reset();
+            setStatus(message.message);
+          }
+        };
+
+        transcriptSocket.onerror = () => {
+          setStatus("Transcript WebSocket error");
+          reject(new Error("Transcript WebSocket error"));
+        };
+      });
+    }
+
+    async function createPlayer() {
+      audioContext = audioContext || new AudioContext({ sampleRate: 48000 });
+
+      if (!workletLoaded) {
+        await audioContext.audioWorklet.addModule("/static/pcm-player.js");
+        workletLoaded = true;
+      }
+
+      if (playerNode) {
+        playerNode.port.postMessage({ type: "reset" });
+        playerNode.disconnect();
+      }
+
+      playerNode = new AudioWorkletNode(audioContext, "pcm-player", {
+        outputChannelCount: [1],
+      });
+      playerNode.port.onmessage = (event) => {
+        if (event.data && event.data.type === "level") {
+          assistantAudioMeter.updateFromLevel(event.data.value);
+        }
+      };
+      playerNode.connect(audioContext.destination);
+      await audioContext.resume();
+    }
+
+    async function requestMicrophonePermission() {
+      return userAudioMeter.start();
+    }
+
+    function sendResult(text, type) {
+      if (!transcriptSocket || transcriptSocket.readyState !== WebSocket.OPEN) {
+        console.log("Transcript WebSocket is not open.");
+        return;
+      }
+
+      transcriptSocket.send(JSON.stringify({ type: type, text: text }));
+    }
+
+    if (!SpeechRecognition || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+
+      console.log("This browser isn't supported.");
+      startButton.disabled = true;
+      stopButton.disabled = true;
+      
+    } else {
+      const recognition = new SpeechRecognition();
+
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = speechLanguage;
+
+      recognition.onstart = () => {
+        setListening(true);
+        setStatus("Listening");
+        console.log("Listening...");
+      };
+
+      recognition.onresult = (event) => {
+        let final = "";
+        let interim = "";
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const text = event.results[i][0].transcript;
+          event.results[i].isFinal ? final += text : interim += text;
+        }
+
+        if (interim) {
+          console.log("Interim result:", interim);
+          sendResult(interim, "interim");
+        }
+        if (final) {
+          console.log("Final result:", final);
+          sendResult(final, "final");
+        }
+      };
+
+      recognition.onerror = (event) => {
+        console.log("Speech recognition error:", event.error);
+      };
+
+      recognition.onend = () => {
+        setListening(false);
+        userAudioMeter.stop();
+        if (statusEl.textContent !== "Speaking") {
+          setStatus("Idle");
+        }
+        console.log("Stopped.");
+      };
+
+      startButton.onclick = async () => {
+        const allowed = await requestMicrophonePermission();
+        if (!allowed) return;
+
+        try {
+          await openTranscriptSocket();
+          await createPlayer();
+          recognition.start();
+        } catch {
+          userAudioMeter.stop();
+          console.log("Could not start speech recognition.");
+        }
+      };
+
+      stopButton.onclick = () => recognition.stop();
+    }
+  </script>
+
+</body>
+</html>
