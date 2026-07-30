@@ -1,0 +1,4 @@
+pint
+sounddevice
+pyfxr
+numpy
