@@ -1,9 +1,0 @@
-.DS_Store
-.venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-
-# Local game state and working copies
-save.json
-backups/
